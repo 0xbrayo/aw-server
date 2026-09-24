@@ -1,9 +1,12 @@
+import copy
 import functools
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
 from socket import gethostname
+from threading import RLock
+from contextlib import closing
 from typing import (
     Any,
     Dict,
@@ -23,6 +26,7 @@ from aw_transform import heartbeat_merge
 from .__about__ import __version__
 from .exceptions import NotFound
 from .profile import profile_from_env
+from .query_cache import QueryCache, ReadTracker
 from .settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,21 @@ def check_bucket_exists(f):
     return g
 
 
+def bucket_mutation(metadata=False):
+    """Serialize writes with heartbeat merging and invalidate dependent queries."""
+
+    def decorate(f):
+        @functools.wraps(f)
+        def wrapped(self, bucket_id, *args, **kwargs):
+            with self._write_lock, self.query_cache.mutation(bucket_id, metadata):
+                self.last_event.pop(bucket_id, None)
+                return f(self, bucket_id, *args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
 class ServerAPI:
     def __init__(self, db, testing) -> None:
         self.db = db
@@ -63,6 +82,8 @@ class ServerAPI:
         self.testing = testing
         self.profile = profile_from_env(testing=testing)
         self.last_event = {}  # type: dict
+        self._write_lock = RLock()
+        self.query_cache = QueryCache()
 
     def get_info(self) -> Dict[str, Any]:
         """Get server info"""
@@ -78,15 +99,7 @@ class ServerAPI:
     def get_buckets(self) -> Dict[str, Dict]:
         """Get dict {bucket_name: Bucket} of all buckets"""
         logger.debug("Received get request for buckets")
-        buckets = self.db.buckets()
-        for b in buckets:
-            # TODO: Move this code to aw-core?
-            last_events = self.db[b].get(limit=1)
-            if len(last_events) > 0:
-                last_event = last_events[0]
-                last_updated = last_event.timestamp + last_event.duration
-                buckets[b]["last_updated"] = last_updated.isoformat()
-        return buckets
+        return self.db.buckets(include_last_updated=True)
 
     @check_bucket_exists
     def get_bucket_metadata(self, bucket_id: str) -> Dict[str, Any]:
@@ -106,44 +119,93 @@ class ServerAPI:
 
     def export_all(self) -> Dict[str, Any]:
         """Exports all buckets and their events to a format consistent across versions"""
-        buckets = self.get_buckets()
+        buckets = self.db.buckets()
         exported_buckets = {}
         for bid in buckets.keys():
             exported_buckets[bid] = self.export_bucket(bid)
         return exported_buckets
 
+    def stream_export(self, bucket_id=None):
+        # Validate before returning the generator so a missing bucket is a 404,
+        # not an exception after the HTTP response has started.
+        if bucket_id is not None:
+            buckets = {bucket_id: self.get_bucket_metadata(bucket_id)}
+        else:
+            buckets = self.db.buckets()
+
+        def generate():
+            yield '{"buckets":{'
+            for index, (bid, metadata) in enumerate(buckets.items()):
+                if index:
+                    yield ","
+                yield json.dumps(bid) + ":"
+                yield json.dumps(metadata)[:-1] + ',"events":['
+                with closing(self.db[bid].iter_events()) as events:
+                    for event_index, event in enumerate(events):
+                        if event_index:
+                            yield ","
+                        payload = event.to_json_dict()
+                        payload.pop("id", None)
+                        yield json.dumps(payload)
+                yield "]}"
+            yield "}}"
+
+        def buffered():
+            # Avoid a socket write for every separator/small event while retaining
+            # only a bounded batch (plus the largest individual event).
+            with closing(generate()) as fragments:
+                batch = []
+                size = 0
+                for fragment in fragments:
+                    batch.append(fragment)
+                    size += len(fragment)
+                    if size >= 64 * 1024:
+                        yield "".join(batch)
+                        batch = []
+                        size = 0
+                if batch:
+                    yield "".join(batch)
+
+        return buffered()
+
     def import_bucket(self, bucket_data: Any):
         bucket_id = bucket_data["id"]
-        logger.info(f"Importing bucket {bucket_id}")
+        with self._write_lock, self.query_cache.mutation(bucket_id, metadata=True):
+            self.last_event.pop(bucket_id, None)
+            logger.info(f"Importing bucket {bucket_id}")
 
-        # TODO: Check that bucket doesn't already exist
-        self.db.create_bucket(
-            bucket_id,
-            type=bucket_data["type"],
-            client=bucket_data["client"],
-            hostname=bucket_data["hostname"],
-            created=(
-                bucket_data["created"]
-                if isinstance(bucket_data["created"], datetime)
-                else iso8601.parse_date(bucket_data["created"])
-            ),
-        )
+            # TODO: Check that bucket doesn't already exist
+            self.db.create_bucket(
+                bucket_id,
+                type=bucket_data["type"],
+                client=bucket_data["client"],
+                hostname=bucket_data["hostname"],
+                created=(
+                    bucket_data["created"]
+                    if isinstance(bucket_data["created"], datetime)
+                    else iso8601.parse_date(bucket_data["created"])
+                ),
+            )
 
-        # scrub IDs from events
-        # (otherwise causes weird bugs with no events seemingly imported when importing events exported from aw-server-rust, which contains IDs)
-        for event in bucket_data["events"]:
-            if "id" in event:
-                del event["id"]
+            # scrub IDs from events
+            # (otherwise causes weird bugs with no events seemingly imported when importing events exported from aw-server-rust, which contains IDs)
+            for event in bucket_data["events"]:
+                if "id" in event:
+                    del event["id"]
 
-        self.create_events(
-            bucket_id,
-            [Event(**e) if isinstance(e, dict) else e for e in bucket_data["events"]],
-        )
+            self.create_events(
+                bucket_id,
+                [
+                    Event(**e) if isinstance(e, dict) else e
+                    for e in bucket_data["events"]
+                ],
+            )
 
     def import_all(self, buckets: Dict[str, Any]):
         for bid, bucket in buckets.items():
             self.import_bucket(bucket)
 
+    @bucket_mutation(metadata=True)
     def create_bucket(
         self,
         bucket_id: str,
@@ -163,7 +225,7 @@ class ServerAPI:
         """
         if created is None:
             created = datetime.now()
-        if bucket_id in self.db.buckets():
+        if self.db.has_bucket(bucket_id):
             return False
         if hostname == "!local":
             info = self.get_info()
@@ -181,6 +243,7 @@ class ServerAPI:
         )
         return True
 
+    @bucket_mutation(metadata=True)
     @check_bucket_exists
     def update_bucket(
         self,
@@ -193,13 +256,14 @@ class ServerAPI:
         """Update bucket metadata"""
         self.db.update_bucket(
             bucket_id,
-            type=event_type,
+            type_id=event_type,
             client=client,
             hostname=hostname,
             data=data,
         )
         return None
 
+    @bucket_mutation(metadata=True)
     @check_bucket_exists
     def delete_bucket(self, bucket_id: str) -> None:
         """Delete a bucket"""
@@ -237,6 +301,7 @@ class ServerAPI:
         ]
         return events
 
+    @bucket_mutation(metadata=False)
     @check_bucket_exists
     def create_events(self, bucket_id: str, events: List[Event]) -> List[Event]:
         """Create events for a bucket. Can handle both single events and multiple ones.
@@ -264,12 +329,12 @@ class ServerAPI:
         logger.debug("Received get request for eventcount in bucket '%s'", bucket_id)
         return self.db[bucket_id].get_eventcount(start, end)
 
+    @bucket_mutation(metadata=False)
     @check_bucket_exists
     def delete_event(self, bucket_id: str, event_id) -> bool:
         """Delete a single event from a bucket"""
         return self.db[bucket_id].delete(event_id)
 
-    @check_bucket_exists
     def heartbeat(self, bucket_id: str, heartbeat: Event, pulsetime: float) -> Event:
         """
         Heartbeats are useful when implementing watchers that simply keep
@@ -292,6 +357,15 @@ class ServerAPI:
 
         Inspired by: https://wakatime.com/developers#heartbeats
         """
+        with self._write_lock, self.query_cache.mutation(bucket_id) as change:
+            event = self._heartbeat(bucket_id, heartbeat, pulsetime)
+            # Invalidate every interval touched by the event, including the old
+            # duration when a heartbeat is merged. Other days stay cached.
+            change.span = (event.timestamp, event.timestamp + event.duration)
+            return event
+
+    @check_bucket_exists
+    def _heartbeat(self, bucket_id: str, heartbeat: Event, pulsetime: float) -> Event:
         logger.debug(
             "Received heartbeat in bucket '%s'\n\ttimestamp: %s, duration: %s, pulsetime: %s\n\tdata: %s",
             bucket_id,
@@ -301,22 +375,13 @@ class ServerAPI:
             heartbeat.data,
         )
 
-        # The endtime here is set such that in the event that the heartbeat is older than an
-        # existing event we should try to merge it with the last event before the heartbeat instead.
-        # FIXME: This (the endtime=heartbeat.timestamp) gets rid of the "heartbeat was older than last event"
-        #        warning and also causes a already existing "newer" event to be overwritten in the
-        #        replace_last call below. This is problematic.
-        # Solution: This could be solved if we were able to replace arbitrary events.
-        #           That way we could double check that the event has been applied
-        #           and if it hasn't we simply replace it with the updated counterpart.
-
         last_event = None
         if bucket_id not in self.last_event:
             last_events = self.db[bucket_id].get(limit=1)
             if len(last_events) > 0:
                 last_event = last_events[0]
         else:
-            last_event = self.last_event[bucket_id]
+            last_event = copy.copy(self.last_event[bucket_id])
 
         if last_event:
             if last_event.data == heartbeat.data:
@@ -326,9 +391,13 @@ class ServerAPI:
                     logger.debug(
                         "Received valid heartbeat, merging. (bucket: %s)", bucket_id
                     )
-                    self.last_event[bucket_id] = merged
-                    self.db[bucket_id].replace_last(merged)
-                    return merged
+                    if merged.id is not None and self.db[bucket_id].replace(
+                        merged.id, merged
+                    ):
+                        self.last_event[bucket_id] = merged
+                        return merged
+                    # The row may have been removed by another datastore user.
+                    self.last_event.pop(bucket_id, None)
                 else:
                     logger.info(
                         "Received heartbeat after pulse window, inserting as new event. (bucket: %s)",
@@ -345,12 +414,13 @@ class ServerAPI:
                 bucket_id,
             )
 
-        self.db[bucket_id].insert(heartbeat)
-        self.last_event[bucket_id] = heartbeat
-        return heartbeat
+        inserted = self.db[bucket_id].insert(heartbeat)
+        self.last_event[bucket_id] = inserted
+        return inserted
 
     def query2(self, name, query, timeperiods, cache):
         result = []
+        query = "".join(query)
         for timeperiod in timeperiods:
             period = timeperiod.split("/")[
                 :2
@@ -365,8 +435,16 @@ class ServerAPI:
                 endtime = iso8601.parse_date(period[1])
             except iso8601.ParseError as e:
                 raise QueryException(f"Invalid timeperiod '{timeperiod}': {e}")
-            query = "".join(query)
-            result.append(query2.query(name, query, starttime, endtime, self.db))
+            if not cache:
+                result.append(query2.query(name, query, starttime, endtime, self.db))
+                continue
+            key = (name, query, starttime, endtime)
+            hit, value, revision = self.query_cache.lookup(key)
+            if not hit:
+                tracker = ReadTracker(self.db)
+                value = query2.query(name, query, starttime, endtime, tracker)
+                self.query_cache.store(key, value, tracker, revision)
+            result.append(value)
         return result
 
     # TODO: Right now the log format on disk has to be JSON, this is hard to read by humans...

@@ -12,7 +12,8 @@ from flask import (
     Blueprint,
     current_app,
     jsonify,
-    make_response,
+    Response,
+    stream_with_context,
     request,
 )
 from flask_restx import Api, Resource, fields
@@ -318,15 +319,19 @@ class HeartbeatResource(Resource):
 class QueryResource(Resource):
     # TODO Docs
     @api.expect(query, validate=True)
-    @api.param("name", "Name of the query (required if using cache)")
+    @api.param("name", "Name of the query")
+    @api.param("cache", "Cache query results (default: 1; set to 0 to bypass)")
     def post(self):
         name = ""
         if "name" in request.args:
             name = request.args["name"]
         query = request.get_json()
+        cache_arg = request.args.get("cache", "1").lower()
+        if cache_arg not in ("0", "1", "false", "true"):
+            raise BadRequest("InvalidParameter", "cache must be 0, 1, false, or true")
         try:
             result = current_app.api.query2(
-                name, query["query"], query["timeperiods"], False
+                name, query["query"], query["timeperiods"], cache_arg in ("1", "true")
             )
             return jsonify(result)
         except QueryException as qe:
@@ -342,9 +347,10 @@ class ExportAllResource(Resource):
     @api.doc(model=buckets_export)
     @copy_doc(ServerAPI.export_all)
     def get(self):
-        buckets_export = current_app.api.export_all()
-        payload = {"buckets": buckets_export}
-        response = make_response(json.dumps(payload))
+        response = Response(
+            stream_with_context(current_app.api.stream_export()),
+            mimetype="application/json",
+        )
         filename = "aw-buckets-export.json"
         response.headers["Content-Disposition"] = "attachment; filename={}".format(
             filename
@@ -358,10 +364,11 @@ class BucketExportResource(Resource):
     @api.doc(model=buckets_export)
     @copy_doc(ServerAPI.export_bucket)
     def get(self, bucket_id):
-        bucket_export = current_app.api.export_bucket(bucket_id)
-        payload = {"buckets": {bucket_export["id"]: bucket_export}}
-        response = make_response(json.dumps(payload))
-        filename = "aw-bucket-export_{}.json".format(bucket_export["id"])
+        response = Response(
+            stream_with_context(current_app.api.stream_export(bucket_id)),
+            mimetype="application/json",
+        )
+        filename = "aw-bucket-export_{}.json".format(bucket_id)
         response.headers["Content-Disposition"] = "attachment; filename={}".format(
             filename
         )
